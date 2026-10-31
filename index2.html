@@ -1,0 +1,738 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>Land Cruiser AR</title>
+<script src="https://aframe.io/releases/1.3.0/aframe.min.js"></script>
+<style>
+  :root {
+    --fg: #ffffff;
+    --fg-dim: rgba(255,255,255,.7);
+    --glass: rgba(20,20,20,.55);
+    --line: rgba(255,255,255,.18);
+    --font: -apple-system, "Hiragino Sans", "Noto Sans JP", "Yu Gothic", sans-serif;
+  }
+  [hidden] { display: none !important; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; font-family: var(--font); }
+
+  .ui { position: fixed; left: 0; right: 0; z-index: 10; display: flex; justify-content: center; pointer-events: none;
+        padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+  .ui > * { pointer-events: auto; }
+  #top { bottom: 0; padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 84px); }
+  #hint { color: var(--fg); background: var(--glass); padding: 8px 14px; border-radius: 8px;
+          font-size: 15px; letter-spacing: .02em; transition: opacity .4s;
+          -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+  #hint.found { opacity: 0; }
+  #statusWrap { top: 50%; transform: translateY(-50%); }
+  #status { color: var(--fg); background: var(--glass); padding: 10px 16px; border-radius: 8px; font-size: 15px;
+            font-variant-numeric: tabular-nums; -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+  #bottom { top: 0; padding-top: calc(env(safe-area-inset-top, 0px) + 12px); }
+  .bar { display: flex; border-radius: 12px; overflow: hidden; background: var(--glass);
+         -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); border: 1px solid var(--line); }
+  .bar button { appearance: none; border: 0; background: none; color: var(--fg); font: 500 15px/1 var(--font);
+                padding: 14px 14px; min-width: 70px; cursor: pointer; white-space: nowrap; }
+  .bar button[aria-pressed="true"] { background: rgba(255, 236, 190, .22); }
+  #tapHint { color: var(--fg-dim); font-size: 13px; margin-top: 8px; text-align: center; transition: opacity .6s; }
+  #dusk { position: fixed; inset: 0; z-index: 1; pointer-events: none; background: rgba(12, 18, 38, .55);
+          opacity: 0; transition: opacity .8s; }
+  #dusk.on { opacity: 1; }
+  .bar button + button { border-left: 1px solid var(--line); }
+  .bar button:active { background: rgba(255,255,255,.12); }
+  .bar button:focus-visible { outline: 2px solid var(--fg); outline-offset: -2px; }
+
+  #start { position: fixed; inset: 0; z-index: 20; background: #111; color: var(--fg);
+           display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; text-align: center;
+           padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+  #start h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: .06em; }
+  #start p { margin: 0; font-size: 15px; line-height: 1.7; color: var(--fg-dim); }
+  #goBtn { margin-top: 10px; appearance: none; border: 1px solid var(--fg); background: none; color: var(--fg);
+           font: 500 17px/1 var(--font); padding: 14px 40px; border-radius: 10px; cursor: pointer; }
+  #goBtn:active { background: rgba(255,255,255,.12); }
+  #err { color: #ff9b85; }
+</style>
+</head>
+<body>
+
+<div id="start">
+  <h1>Land Cruiser AR</h1>
+  <p>カメラを許可して、カード中央のマークを映してください。</p>
+  <button id="goBtn">開始</button>
+  <p id="err" hidden></p>
+</div>
+
+<div class="ui" id="top"><div id="hint">カードを映してください</div></div>
+<div class="ui" id="statusWrap"><div id="status" hidden></div></div>
+<div id="dusk"></div>
+<div class="ui" id="bottom" hidden>
+  <div class="bar">
+    <button id="stopBtn">停止</button>
+    <button id="speedBtn">低速</button>
+    <button id="lightBtn" aria-pressed="false">ライト</button>
+    <button id="roadBtn">岩場</button>
+  </div>
+</div>
+<div class="ui" id="tapWrap" hidden style="top: calc(env(safe-area-inset-top, 0px) + 64px)"><div id="tapHint">画面をタップするとエンジンを吹かします</div></div>
+
+<script>
+/* ===== 設定 ===== */
+const CONFIG = {
+  bodyColor: new URLSearchParams(location.search).get('color') || '#e9e4d6', // 車体の色 (?color=%23c8b48a など)
+  // ランクルのモデル (前向き +X、全長 1 に変換済み)。読めなければオリジナルの四駆を出します。
+  glbFile: 'car.glb',
+  carLength: 2.05,   // 車の全長 (黒い四角の幅 64mm = 1 → 約131mm、カードいっぱい)
+  cardHalfW: 74 / 64, // カードの半分の横幅 (148mm)
+  cardHalfH: 50 / 64, // カードの半分の縦幅 (100mm)
+};
+const DEMO = new URLSearchParams(location.search).has('demo');
+const THREE = AFRAME.THREE;
+
+/* ===== オリジナルの四駆 (ショートボディのクロカン) ===== */
+function buildCar(color) {
+  const g = new THREE.Group();
+  const mat = c => new THREE.MeshStandardMaterial({ color: c, roughness: 0.6, metalness: 0.05 });
+  const body = mat(color), black = mat('#1d1d1d'), glass = mat('#27323a'), chrome = mat('#b9b9b9');
+  const lamp = new THREE.MeshStandardMaterial({ color: '#fff6d0', emissive: '#ffe9a0', emissiveIntensity: 0.6 });
+  const tail = new THREE.MeshStandardMaterial({ color: '#c0281f', emissive: '#7a0d08', emissiveIntensity: 0.5 });
+  const box = (w, h, d, m, x, y, z) => { const o = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m); o.position.set(x, y, z); g.add(o); return o; };
+  const cyl = (r, l, m, x, y, z, axis) => {
+    const o = new THREE.Mesh(new THREE.CylinderGeometry(r, r, l, 24), m);
+    if (axis === 'z') o.rotation.x = Math.PI / 2; else if (axis === 'x') o.rotation.z = Math.PI / 2;
+    o.position.set(x, y, z); g.add(o); return o;
+  };
+  // 車体 (前向き = +x)
+  box(3.9, 0.62, 1.70, body, 0, 0.92, 0);           // 下半分
+  box(1.45, 0.10, 1.66, body, 1.22, 1.27, 0);        // ボンネット
+  box(2.45, 0.76, 1.62, body, -0.68, 1.60, 0);       // キャビン (角ばった箱)
+  box(2.50, 0.06, 1.66, body, -0.68, 2.00, 0);       // ルーフ
+  // 窓
+  box(0.04, 0.52, 1.44, glass, 0.535, 1.62, 0);      // フロントガラス
+  box(0.04, 0.48, 1.40, glass, -1.915, 1.64, 0);     // リア窓
+  for (const s of [1, -1]) {
+    box(0.72, 0.46, 0.04, glass, 0.08, 1.64, s * 0.815);
+    box(1.40, 0.46, 0.04, glass, -1.12, 1.64, s * 0.815);
+  }
+  // フェンダー (黒いオーバーフェンダー)
+  for (const x of [1.15, -1.15]) for (const s of [1, -1]) box(1.12, 0.14, 0.12, black, x, 1.02, s * 0.88);
+  // バンパー
+  box(0.20, 0.20, 1.86, black, 2.02, 0.62, 0);
+  box(0.20, 0.20, 1.80, black, -2.02, 0.62, 0);
+  // グリル + 丸目ライト
+  box(0.05, 0.40, 1.20, black, 1.97, 0.98, 0);
+  for (const s of [1, -1]) {
+    cyl(0.15, 0.06, chrome, 1.985, 1.0, s * 0.62, 'x');
+    cyl(0.12, 0.08, lamp, 1.995, 1.0, s * 0.62, 'x');
+    box(0.06, 0.16, 0.10, tail, -1.97, 1.05, s * 0.74);   // テールランプ
+    box(0.18, 0.12, 0.06, black, 0.45, 1.52, s * 0.90);   // ミラー
+  }
+  // シュノーケル (右前)
+  box(0.12, 0.70, 0.12, black, 0.62, 1.60, 0.90);
+  box(0.26, 0.12, 0.14, black, 0.69, 2.00, 0.90);
+  // ルーフキャリア
+  for (const z of [0.6, -0.6]) box(2.2, 0.05, 0.05, black, -0.70, 2.12, z);
+  for (const x of [0.3, -0.7, -1.7]) box(0.05, 0.05, 1.25, black, x, 2.12, 0);
+  // 背面スペアタイヤ
+  cyl(0.38, 0.26, black, -2.12, 1.25, 0.32, 'x');
+  cyl(0.18, 0.28, chrome, -2.12, 1.25, 0.32, 'x');
+  // タイヤ
+  const wheels = [];
+  for (const x of [1.15, -1.15]) for (const s of [1, -1]) {
+    const w = new THREE.Group(); w.position.set(x, 0.42, s * 0.80);
+    const tire = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.42, 0.32, 24), black); tire.rotation.x = Math.PI / 2;
+    const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 0.34, 12), chrome); hub.rotation.x = Math.PI / 2;
+    const tread = new THREE.Mesh(new THREE.BoxGeometry(0.86, 0.08, 0.36), mat('#333')); // 回転が見える目印
+    w.add(tire, hub, tread); g.add(w); wheels.push(w);
+  }
+  // 影
+  const sh = new THREE.Mesh(new THREE.CircleGeometry(1, 32),
+    new THREE.MeshBasicMaterial({ color: '#000', transparent: true, opacity: 0.28, depthWrite: false }));
+  sh.rotation.x = -Math.PI / 2; sh.scale.set(2.3, 1.1, 1); sh.position.y = 0.01; g.add(sh);
+  g.userData.wheels = wheels;
+  return g;
+}
+
+/* ===== 読み込み表示 ===== */
+function setStatus(t) {
+  const el = document.getElementById('status');
+  if (!el) return;
+  el.textContent = t; el.hidden = !t;
+}
+
+/* ===== メッキが映り込むための簡単な環境光 ===== */
+let envDone = false;
+function applyEnvironment(sceneEl) {
+  if (envDone || !sceneEl.renderer) return; envDone = true;
+  try {
+    const r = sceneEl.renderer;
+    const env = new THREE.Scene();
+    const geo = new THREE.SphereGeometry(10, 32, 16);
+    const col = []; const pos = geo.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const y = pos.getY(i) / 10;
+      const c = y > 0 ? new THREE.Color('#f4f6f8').lerp(new THREE.Color('#bcc6d0'), 1 - y) : new THREE.Color('#6b665e').lerp(new THREE.Color('#2e2b27'), -y);
+      col.push(c.r, c.g, c.b);
+    }
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    env.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide })));
+    for (const [x, y, z, w] of [[4, 6, 3, 4], [-5, 5, -2, 3]]) {
+      const p = new THREE.Mesh(new THREE.PlaneGeometry(w, w * 0.6), new THREE.MeshBasicMaterial({ color: '#ffffff', side: THREE.DoubleSide }));
+      p.position.set(x, y, z); p.lookAt(0, 0, 0); env.add(p);
+    }
+    const pm = new THREE.PMREMGenerator(r);
+    sceneEl.object3D.environment = pm.fromScene(env, 0.04).texture;
+    pm.dispose();
+  } catch (e) { /* 環境光なしでも表示はできる */ }
+}
+
+/* ===== 路面の種類 ===== */
+const SURFACES = [
+  { id: 'rock',  label: '岩場' },
+  { id: 'water', label: '水たまり' },
+  { id: 'mud',   label: 'ぬかるみ' },
+  { id: 'snow',  label: '雪道' },
+];
+
+function radialTexture(inner, outer) {
+  const c = document.createElement('canvas'); c.width = c.height = 128;
+  const g = c.getContext('2d'), gr = g.createRadialGradient(64, 64, 0, 64, 64, 64);
+  gr.addColorStop(0, inner); gr.addColorStop(1, outer);
+  g.fillStyle = gr; g.fillRect(0, 0, 128, 128);
+  const t = new THREE.CanvasTexture(c); return t;
+}
+
+/* ===== 走る動き: カードいっぱいの大きさで、その場で走っている ===== */
+AFRAME.registerComponent('drive', {
+  init() {
+    this.running = true; this.base = 1; this.v = 0; this.dist = 0; this.wheelDist = 0; this.time = 0;
+    this.surface = 'rock'; this.lightsOn = false; this.rev = 0; this.revT = 99;
+    const CL = CONFIG.carLength, root = this.el.object3D;
+    this.holder = new THREE.Group();
+    this.bob = new THREE.Group();
+    this.holder.add(this.bob);
+    root.add(this.holder);
+    this.wheels = []; this.wheelR = 1;
+    this.pose = { y: 0, rz: 0, rx: 0 };
+    this.loadModel();
+
+    // 後ろへ流れる路面のライン
+    this.lines = [];
+    const lm = new THREE.MeshBasicMaterial({ color: '#4a4740', transparent: true, opacity: 0.55, depthWrite: false });
+    for (const z of [-CONFIG.cardHalfH * 0.78, CONFIG.cardHalfH * 0.78]) {
+      for (let i = 0; i < 7; i++) {
+        const m = new THREE.Mesh(new THREE.PlaneGeometry(CL * 0.12, CL * 0.012), lm);
+        m.rotation.x = -Math.PI / 2; m.position.set(0, 0.002, z); m.userData.off = i / 7;
+        root.add(m); this.lines.push(m);
+      }
+    }
+
+    // 粒 (砂ぼこり・水しぶき・泥・雪けむり)
+    this.parts = [];
+    const pg = new THREE.SphereGeometry(1, 8, 6);
+    for (let i = 0; i < 90; i++) {
+      const p = new THREE.Mesh(pg, new THREE.MeshBasicMaterial({ transparent: true, depthWrite: false }));
+      p.visible = false; p.userData = { life: 0, decay: 1, v: new THREE.Vector3(), g: 0, size: 0, grow: 0, op: 0.5 };
+      root.add(p); this.parts.push(p);
+    }
+    this.partTimer = 0;
+
+    // 路面の障害物
+    this.obs = [];
+    const mk = (geo, mat, type, n) => {
+      for (let i = 0; i < n; i++) {
+        const m = new THREE.Mesh(typeof geo === 'function' ? geo() : geo, mat);
+        m.visible = false; m.userData = { type, h: 0, r: 0, grow: 0 };
+        root.add(m); this.obs.push(m);
+      }
+    };
+    const rockGeo = () => {
+      const g = new THREE.DodecahedronGeometry(1, 0), p = g.attributes.position;
+      for (let j = 0; j < p.count; j++) p.setXYZ(j, p.getX(j) * (0.8 + Math.random() * 0.4), p.getY(j) * (0.8 + Math.random() * 0.4), p.getZ(j) * (0.8 + Math.random() * 0.4));
+      g.computeVertexNormals(); return g;
+    };
+    mk(rockGeo, new THREE.MeshStandardMaterial({ color: '#8a8276', roughness: 0.95, flatShading: true }), 'rock', 8);
+    const disc = new THREE.CircleGeometry(1, 28); disc.rotateX(-Math.PI / 2);
+    mk(disc, new THREE.MeshStandardMaterial({ color: '#56656e', roughness: 0.08, metalness: 0.2, transparent: true, opacity: 0.78 }), 'water', 6);
+    const blob = () => {
+      const g = new THREE.CircleGeometry(1, 20); const p = g.attributes.position;
+      for (let j = 1; j < p.count; j++) { const k = 0.75 + Math.random() * 0.4; p.setXY(j, p.getX(j) * k, p.getY(j) * k); }
+      g.rotateX(-Math.PI / 2); return g;
+    };
+    mk(blob, new THREE.MeshStandardMaterial({ color: '#4b3a2a', roughness: 0.55 }), 'mud', 7);
+    const mound = new THREE.SphereGeometry(1, 16, 8, 0, Math.PI * 2, 0, Math.PI / 2);
+    mk(mound, new THREE.MeshStandardMaterial({ color: '#f4f6f8', roughness: 0.9 }), 'snow', 8);
+    this.obsTimer = 0.4; this.lastTrack = 1;
+
+    // 降る雪
+    this.flakes = [];
+    const fm = new THREE.MeshBasicMaterial({ color: '#ffffff', transparent: true, opacity: 0.9 });
+    const fg = new THREE.SphereGeometry(CL * 0.006, 6, 4);
+    for (let i = 0; i < 70; i++) {
+      const f = new THREE.Mesh(fg, fm); f.visible = false;
+      f.position.set((Math.random() * 2 - 1) * CONFIG.cardHalfW, Math.random() * CL * 0.9, (Math.random() * 2 - 1) * CONFIG.cardHalfH);
+      f.userData.s = 0.6 + Math.random() * 0.8; f.userData.ph = Math.random() * 6;
+      root.add(f); this.flakes.push(f);
+    }
+
+    // ヘッドライトの光だまり (車の前の地面)
+    const pool = new THREE.Mesh(new THREE.PlaneGeometry(1, 1),
+      new THREE.MeshBasicMaterial({ map: radialTexture('rgba(255,236,190,0.9)', 'rgba(255,236,190,0)'), transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
+    pool.rotation.x = -Math.PI / 2; pool.position.set(CL * 0.78, 0.004, 0); pool.scale.set(CL * 0.75, CL * 0.62, 1);
+    pool.visible = false; this.holder.add(pool); this.pool = pool;
+    this.spot = new THREE.SpotLight('#ffe9c0', 0, CL * 2.5, 0.6, 0.6, 1.5);
+    this.spot.position.set(CL * 0.45, CL * 0.2, 0); this.spot.target.position.set(CL * 1.2, 0, 0);
+    this.holder.add(this.spot, this.spot.target);
+  },
+
+  setupWheels(scale) {
+    this.wheelScale = scale;
+    this.wheelBase = this.wheels.map(w => w.position.clone());
+  },
+
+  useFallback() {
+    if (this.model) return;
+    const SCALE = CONFIG.carLength / 4.4;
+    const car = buildCar(CONFIG.bodyColor);
+    car.scale.setScalar(SCALE);
+    this.bob.add(car); this.model = car;
+    this.wheels = car.userData.wheels; this.wheelR = 0.42 * SCALE;
+    this.setupWheels(SCALE);
+    this.lampMats = [];
+    setStatus('');
+  },
+
+  loadModel() {
+    const CL = CONFIG.carLength;
+    const onModel = (root) => {
+      root.scale.setScalar(CL);
+      this.bob.add(root); this.model = root;
+      this.wheels = ['wheel_FL', 'wheel_FR', 'wheel_RL', 'wheel_RR'].map(n => root.getObjectByName(n)).filter(Boolean);
+      const r = this.wheels[0] && this.wheels[0].userData && this.wheels[0].userData.radius;
+      this.wheelR = (r || 0.1) * CL;
+      this.setupWheels(CL);
+      // ライトの部品 (前側だけ) を探して、点灯用の光を付ける
+      this.lampMats = []; const lampPos = [];
+      root.updateMatrixWorld(true);
+      const inv = new THREE.Matrix4().copy(root.matrixWorld).invert();
+      root.traverse(o => {
+        if (!o.isMesh) return;
+        o.frustumCulled = false; o.material.envMapIntensity = 0.6;
+        if (o.material.transparent) o.renderOrder = 2;
+        if (o.material.name === 'light') {
+          if (!this.lampMats.includes(o.material)) this.lampMats.push(o.material);
+          o.geometry.computeBoundingBox();
+          const c = o.geometry.boundingBox.getCenter(new THREE.Vector3()).applyMatrix4(o.matrixWorld).applyMatrix4(inv);
+          if (c.x > 0.35) lampPos.push(c);
+        }
+      });
+      const glowTex = radialTexture('rgba(255,244,214,1)', 'rgba(255,244,214,0)');
+      this.glows = lampPos.map(p => {
+        const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTex, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
+        s.position.copy(p).add(new THREE.Vector3(0.02, 0, 0)); s.scale.setScalar(0.09); s.visible = false;
+        root.add(s); return s;
+      });
+      // 接地影
+      const sh = new THREE.Mesh(new THREE.CircleGeometry(0.5, 40),
+        new THREE.MeshBasicMaterial({ color: '#000', transparent: true, opacity: 0.32, depthWrite: false }));
+      sh.rotation.x = -Math.PI / 2; sh.scale.set(CL * 1.08, CL * 0.62, 1); sh.position.y = 0.003;
+      this.holder.add(sh);
+      applyEnvironment(this.el.sceneEl);
+      this.setLights(this.lightsOn);
+      setStatus('');
+    };
+    const L = THREE.GLTFLoader;
+    if (L) {
+      new L().load(CONFIG.glbFile, g => onModel(g.scene),
+        e => { if (e.total) setStatus('読み込み中 ' + Math.round(e.loaded / e.total * 100) + '%'); else setStatus('読み込み中…'); },
+        () => this.useFallback());
+    } else {
+      const ent = document.createElement('a-entity');
+      ent.setAttribute('gltf-model', CONFIG.glbFile);
+      ent.addEventListener('model-loaded', () => { const o = ent.getObject3D('mesh'); this.el.object3D.remove(ent.object3D); onModel(o); });
+      ent.addEventListener('model-error', () => this.useFallback());
+      this.el.appendChild(ent);
+      setStatus('読み込み中…');
+    }
+  },
+
+  /* ライト点灯: 車のライトを光らせ、まわりを夕暮れのように暗くする */
+  setLights(on) {
+    this.lightsOn = on;
+    for (const m of this.lampMats || []) { m.emissive.set(on ? '#fff1cf' : '#463f2e'); m.emissiveIntensity = on ? 2.2 : 1; }
+    for (const g of this.glows || []) g.visible = on;
+    this.pool.visible = on; this.spot.intensity = on ? 2.2 : 0;
+    setDusk(on);
+  },
+
+  setSurface(id) { this.surface = id; this.obsTimer = 0.15; },
+
+  /* タップでエンジンを吹かす */
+  revEngine() {
+    this.revT = 0;
+    engineRev();
+    for (let i = 0; i < 14; i++) this.emitFromWheel(2 + (i % 2), 1.6);
+  },
+
+  spawnObstacle() {
+    if (!this.wheelBase || this.wheelBase.length < 4) return;
+    const type = this.surface;
+    const o = this.obs.find(m => !m.visible && m.userData.type === type);
+    if (!o) return;
+    const CL = CONFIG.carLength, sc = this.wheelScale;
+    const tracks = [this.wheelBase[0].z * sc, this.wheelBase[1].z * sc];
+    this.lastTrack = Math.random() < 0.7 ? 1 - this.lastTrack : this.lastTrack;
+    let z = tracks[this.lastTrack] + (Math.random() - 0.5) * CL * 0.02;
+    let h, rad, w;
+    if (type === 'rock') {
+      const big = Math.random() < 0.35;
+      h = CL * (big ? 0.045 + Math.random() * 0.02 : 0.022 + Math.random() * 0.015);
+      rad = h * (1.5 + Math.random() * 0.6); w = rad * (0.8 + Math.random() * 0.4);
+      o.scale.set(rad, h, w);
+    } else if (type === 'snow') {
+      h = CL * (0.018 + Math.random() * 0.02); rad = CL * (0.07 + Math.random() * 0.05); w = rad * (0.9 + Math.random() * 0.5);
+      o.scale.set(rad, h, w);
+    } else {
+      // 水たまり・ぬかるみ: 平らで広い。ときどき車幅いっぱい
+      h = 0; rad = CL * (0.09 + Math.random() * 0.08);
+      const wide = Math.random() < 0.35;
+      w = wide ? CL * 0.32 : rad * (0.7 + Math.random() * 0.4);
+      if (wide) z = 0;
+      o.scale.set(rad, 1, w);
+    }
+    o.userData.h = h; o.userData.r = rad; o.userData.w = w; o.userData.grow = 0;
+    o.position.set(CONFIG.cardHalfW * 0.98, type === 'water' || type === 'mud' ? 0.0025 : 0, z);
+    o.rotation.y = type === 'rock' ? Math.random() * Math.PI : 0;
+    o.visible = true;
+  },
+
+  /* 各タイヤの下の様子: 高さと、何の上にいるか */
+  groundAt(x, z) {
+    let h = 0, on = null;
+    const halfW = this.wheelR * 0.75;
+    for (const o of this.obs) {
+      if (!o.visible) continue;
+      const u = o.userData;
+      if (Math.abs(o.position.z - z) > halfW + u.w * 0.7) continue;
+      const flat = u.type === 'water' || u.type === 'mud';
+      const span = u.r + (flat ? 0 : this.wheelR * 0.55);
+      const dx = x - o.position.x;
+      if (Math.abs(dx) >= span) continue;
+      if (flat) {
+        on = u.type;
+        const sink = (u.type === 'mud' ? -0.014 : -0.006) * CONFIG.carLength * u.grow;
+        h = Math.min(h, sink);
+      } else {
+        const c = Math.cos(Math.PI / 2 * dx / span);
+        h = Math.max(h, u.h * c * c * (2 - c * c) * u.grow);
+        if (u.type === 'snow') on = 'snow';
+      }
+    }
+    return { h, on };
+  },
+
+  emitFromWheel(i, power) {
+    if (!this.wheelBase || !this.wheelBase[i]) return;
+    const p = this.parts.find(q => !q.visible);
+    if (!p) return;
+    const CL = CONFIG.carLength, sc = this.wheelScale, b = this.wheelBase[i];
+    const side = Math.sign(b.z) || 1, kind = this.surface;
+    const pos = new THREE.Vector3(b.x * sc - this.wheelR * 0.6, this.wheelR * 0.3, b.z * sc + side * this.wheelR * 0.3).applyEuler(this.holder.rotation);
+    p.position.copy(pos);
+    const u = p.userData, r = Math.random;
+    if (kind === 'water') {
+      p.material.color.set('#e4eef3'); u.size = CL * 0.012; u.grow = 0.5; u.op = 0.85; u.decay = 1.6; u.g = CL * 2.2;
+      u.v.set(-CL * (0.1 + r() * 0.3), CL * (0.5 + r() * 0.5), side * CL * (0.15 + r() * 0.35));
+    } else if (kind === 'mud') {
+      p.material.color.set('#4a3826'); u.size = CL * 0.014; u.grow = 0.3; u.op = 0.95; u.decay = 1.1; u.g = CL * 2.0;
+      u.v.set(-CL * (0.5 + r() * 0.5), CL * (0.35 + r() * 0.4), side * CL * r() * 0.15);
+    } else if (kind === 'snow') {
+      p.material.color.set('#ffffff'); u.size = CL * 0.03; u.grow = 2.0; u.op = 0.6; u.decay = 1.2; u.g = 0;
+      u.v.set(-CL * (0.4 + r() * 0.4), CL * (0.06 + r() * 0.1), side * CL * r() * 0.1);
+    } else {
+      p.material.color.set('#c9b08a'); u.size = CL * 0.035; u.grow = 2.2; u.op = 0.4; u.decay = 1.4; u.g = 0;
+      u.v.set(-CL * (0.5 + r() * 0.4), CL * (0.08 + r() * 0.1), side * CL * r() * 0.1);
+    }
+    u.v.multiplyScalar(power || 1).applyEuler(this.holder.rotation);
+    u.life = 1; p.visible = true;
+  },
+
+  tick(time, dtMs) {
+    const dt = Math.min(dtMs || 16, 50) / 1000;
+    const CL = CONFIG.carLength, hw = CONFIG.cardHalfW;
+    this.time += dt;
+    const t = this.time;
+    const slow = this.surface === 'mud' ? 0.75 : this.surface === 'snow' ? 0.85 : 1;
+    const vTarget = this.running ? this.base * slow : 0;
+    this.v += (vTarget - this.v) * Math.min(1, dt * 2);
+    const ground = this.v * CL * 0.6;
+    this.dist += ground * dt;
+    const k = Math.min(1, this.v / Math.max(this.base, 0.01));
+
+    // 吹かし: すばやく上がって、ゆっくり戻る
+    this.revT += dt;
+    const rv = this.revT < 0.15 ? this.revT / 0.15 : Math.max(0, 1 - (this.revT - 0.15) / 1.1);
+    this.rev = rv;
+    // ぬかるみではタイヤが少し空回り
+    const slip = this.surface === 'mud' ? 1.25 : 1;
+    this.wheelDist += (ground * slip + rv * CL * 1.8) * dt;
+
+    const steer = Math.sin(t * 0.7) * 0.10 * k;
+    this.holder.rotation.y = Math.sin(t * 0.7 + 0.8) * 0.02 * k;
+
+    // 障害物を流す・出す
+    this.obsTimer -= dt * k;
+    if (this.obsTimer <= 0) {
+      this.spawnObstacle();
+      const gap = { rock: [0.55, 0.9], water: [0.8, 1.0], mud: [0.5, 0.8], snow: [0.4, 0.7] }[this.surface];
+      this.obsTimer = gap[0] + Math.random() * gap[1];
+    }
+    for (const o of this.obs) {
+      if (!o.visible) continue;
+      o.position.x -= ground * dt;
+      const u = (hw - o.position.x) / (2 * hw);
+      o.userData.grow = Math.max(0, Math.min(1, Math.min(u, 1 - u) / 0.08));
+      if (o.userData.type === 'rock' || o.userData.type === 'snow') o.scale.y = Math.max(1e-4, o.userData.h * o.userData.grow);
+      else { const g = Math.max(1e-4, o.userData.grow); o.scale.x = o.userData.r * g; o.scale.z = o.userData.w * g; }
+      if (o.position.x < -hw * 0.98) o.visible = false;
+    }
+
+    // 4つのタイヤの下の高さから、車体の傾きを決める
+    const contact = [null, null, null, null];
+    if (this.wheelBase && this.wheelBase.length === 4) {
+      const sc = this.wheelScale;
+      const W = this.wheelBase.map(b => ({ x: b.x * sc, z: b.z * sc }));
+      const G = W.map(w => this.groundAt(w.x, w.z));
+      const h = G.map(g => g.h);
+      G.forEach((g, i) => contact[i] = g.on);
+      const xf = W[0].x, xr = W[2].x, zl = W[0].z, zr = W[1].z;
+      const hF = (h[0] + h[1]) / 2, hR = (h[2] + h[3]) / 2, hL = (h[0] + h[2]) / 2, hRt = (h[1] + h[3]) / 2;
+      let tz = Math.atan2(hF - hR, xf - xr) * 1.4;
+      let tx = Math.atan2(hL - hRt, zr - zl);
+      let ty = (h[0] + h[1] + h[2] + h[3]) / 4 * 0.85;
+      if (this.surface === 'mud') { tx += Math.sin(t * 2.3) * 0.012 * k; tz += Math.sin(t * 1.7) * 0.006 * k; }
+      const a = Math.min(1, dt * 14);
+      this.pose.rz += (tz - this.pose.rz) * a;
+      this.pose.rx += (tx - this.pose.rx) * a;
+      this.pose.y += (ty - this.pose.y) * a;
+      const vib = CL * (0.0012 * k + 0.004 * rv);
+      this.bob.position.y = this.pose.y + Math.sin(t * 38) * vib - rv * CL * 0.006;
+      this.bob.rotation.z = this.pose.rz + rv * 0.045;            // 吹かすと鼻先が上がる
+      this.bob.rotation.x = this.pose.rx + Math.sin(t * 31) * 0.002 * k + rv * 0.018;  // エンジンのトルクで少しねじれる
+      const tanZ = Math.tan(this.pose.rz), tanX = Math.tan(this.pose.rx);
+      this.wheels.forEach((w, i) => {
+        const plane = this.pose.y + W[i].x * tanZ - W[i].z * tanX;
+        const off = Math.max(-this.wheelR * 0.7, Math.min(this.wheelR * 0.7, h[i] - plane));
+        w.position.y = this.wheelBase[i].y + off / sc;
+      });
+    }
+    this.wheels.forEach((w, i) => {
+      w.rotation.z = -this.wheelDist / this.wheelR;
+      w.rotation.y = i < 2 ? steer : 0;
+    });
+
+    // 路面のライン
+    for (const m of this.lines) {
+      const u = ((m.userData.off - this.dist / (hw * 2)) % 1 + 1) % 1;
+      m.position.x = hw * 0.95 - u * hw * 1.9;
+      m.material.opacity = 0.5 * Math.min(1, Math.min(u, 1 - u) * 6) * (0.3 + 0.7 * k);
+    }
+
+    // 粒を出す
+    this.partTimer += dt;
+    const every = this.surface === 'rock' ? 0.05 : 0.035;
+    if (this.partTimer > every) {
+      this.partTimer = 0;
+      if (this.surface === 'water') {
+        contact.forEach((c, i) => { if (c === 'water' && k > 0.2) this.emitFromWheel(i); });
+      } else if (this.surface === 'mud') {
+        contact.forEach((c, i) => { if (c === 'mud' && k > 0.2) this.emitFromWheel(i, 1.2); });
+        if (k > 0.3 && Math.random() < 0.5) this.emitFromWheel(2 + (Math.random() < 0.5 ? 0 : 1), 0.7);
+      } else if (k > 0.3 || rv > 0.3) {
+        this.emitFromWheel(2 + (Math.random() < 0.5 ? 0 : 1), 1 + rv);
+      }
+    }
+    for (const p of this.parts) {
+      if (!p.visible) continue;
+      const u = p.userData;
+      u.life -= dt * u.decay;
+      if (u.life <= 0 || p.position.y < -0.01) { p.visible = false; continue; }
+      u.v.y -= u.g * dt;
+      p.position.addScaledVector(u.v, dt);
+      p.scale.setScalar(u.size * (1 + (1 - u.life) * u.grow));
+      p.material.opacity = u.op * u.life;
+    }
+
+    // 降る雪
+    const snowing = this.surface === 'snow';
+    for (const f of this.flakes) {
+      f.visible = snowing;
+      if (!snowing) continue;
+      f.position.y -= CL * 0.12 * f.userData.s * dt;
+      f.position.x -= ground * 0.15 * dt;
+      f.position.z += Math.sin(t * 1.3 + f.userData.ph) * CL * 0.01 * dt;
+      if (f.position.y < 0) {
+        f.position.set((Math.random() * 2 - 1) * hw, CL * 0.9, (Math.random() * 2 - 1) * CONFIG.cardHalfH);
+      }
+    }
+  }
+});
+
+/* ===== エンジンを吹かす音 (ディーゼルっぽい低い音) ===== */
+let audio;
+function engineRev() {
+  try {
+    audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+    if (audio.state === 'suspended') audio.resume();
+    const now = audio.currentTime, dur = 1.4;
+    const out = audio.createGain(), lp = audio.createBiquadFilter();
+    lp.type = 'lowpass'; lp.Q.value = 4;
+    lp.frequency.setValueAtTime(380, now);
+    lp.frequency.linearRampToValueAtTime(1400, now + 0.18);
+    lp.frequency.exponentialRampToValueAtTime(320, now + dur);
+    out.gain.setValueAtTime(0.0001, now);
+    out.gain.linearRampToValueAtTime(0.32, now + 0.06);
+    out.gain.setValueAtTime(0.32, now + 0.3);
+    out.gain.exponentialRampToValueAtTime(0.0001, now + dur);
+    for (const [mul, type, det] of [[1, 'sawtooth', 0], [2, 'square', 7], [0.5, 'sawtooth', -5]]) {
+      const o = audio.createOscillator(); o.type = type; o.detune.value = det;
+      o.frequency.setValueAtTime(42 * mul, now);
+      o.frequency.exponentialRampToValueAtTime(128 * mul, now + 0.2);
+      o.frequency.exponentialRampToValueAtTime(46 * mul, now + dur);
+      const g = audio.createGain(); g.gain.value = mul === 1 ? 0.6 : 0.3;
+      o.connect(g); g.connect(lp); o.start(now); o.stop(now + dur + 0.05);
+    }
+    // ガラガラした感じのノイズ
+    const len = Math.floor(audio.sampleRate * dur), buf = audio.createBuffer(1, len, audio.sampleRate), d = buf.getChannelData(0);
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * 0.5;
+    const n = audio.createBufferSource(); n.buffer = buf;
+    const ng = audio.createGain(); ng.gain.value = 0.25;
+    n.connect(ng); ng.connect(lp); n.start(now);
+    lp.connect(out); out.connect(audio.destination);
+  } catch (e) {}
+  if (navigator.vibrate) navigator.vibrate([30, 40, 60]);
+}
+
+/* ===== 夕暮れ (ライト点灯時) ===== */
+function setDusk(on) {
+  const amb = document.getElementById('ambLight'), dir = document.getElementById('dirLight');
+  if (amb) amb.setAttribute('light', 'intensity', on ? 0.16 : 0.4);
+  if (dir) dir.setAttribute('light', { intensity: on ? 0.22 : 0.65, color: on ? '#9fb2d6' : '#ffffff' });
+  const shade = document.getElementById('dusk');
+  if (shade && !DEMO) shade.classList.toggle('on', on);
+  const plane = document.querySelector('a-plane');
+  if (plane) plane.setAttribute('material', 'color', on ? '#5a6070' : '#ffffff');
+}
+
+/* ===== シーンを作る ===== */
+const CAR_LIGHTS = `
+  <a-entity id="ambLight" light="type: ambient; intensity: 0.4"></a-entity>
+  <a-entity id="dirLight" light="type: directional; intensity: 0.65" position="0.6 2 1"></a-entity>`;
+
+function arScene() {
+  return `
+  <a-scene embedded vr-mode-ui="enabled: false" renderer="logarithmicDepthBuffer: true; antialias: true; alpha: true; colorManagement: true" background="transparent: true"
+           arjs="sourceType: webcam; debugUIEnabled: false; detectionMode: mono; patternRatio: 0.5;">
+    ${CAR_LIGHTS}
+    <a-marker id="marker" type="pattern" url="marker.patt" emitevents="true"
+              smooth="true" smoothCount="8" smoothTolerance="0.01" smoothThreshold="4">
+      <a-entity drive></a-entity>
+    </a-marker>
+    <a-entity camera></a-entity>
+  </a-scene>`;
+}
+
+function demoScene() {
+  return `
+  <a-scene vr-mode-ui="enabled: false" background="color: #2a2620" renderer="antialias: true; colorManagement: true">
+    ${CAR_LIGHTS}
+    <a-plane src="card-preview.jpg" width="2.3125" height="1.5625" rotation="-90 0 0"></a-plane>
+    <a-entity drive></a-entity>
+    <a-entity position="0 0.3 0" rotation="-32 -35 0">
+      <a-entity camera="fov: 50" look-controls="enabled: false" wasd-controls="enabled: false" position="0 0 4.2"></a-entity>
+    </a-entity>
+  </a-scene>`;
+}
+
+function loadScript(src) {
+  return new Promise((ok, ng) => { const s = document.createElement('script'); s.src = src; s.onload = ok; s.onerror = ng; document.head.appendChild(s); });
+}
+
+/* カメラ映像を必ず3Dの下に見えるようにする
+   (AR.js は映像を z-index:-2 に置くため、端末によっては隠れて真っ黒になる) */
+function keepVideoVisible() {
+  const fix = () => {
+    const v = document.getElementById('arjs-video') || document.querySelector('video');
+    if (v) {
+      v.muted = true; v.setAttribute('muted', ''); v.setAttribute('playsinline', ''); v.setAttribute('autoplay', '');
+      Object.assign(v.style, { zIndex: '0', display: 'block', visibility: 'visible', opacity: '1' });
+      if (v.paused) v.play().catch(() => {});
+    }
+    const sceneEl = document.querySelector('a-scene');
+    const canvas = sceneEl && sceneEl.canvas;
+    if (canvas) Object.assign(canvas.style, { position: 'absolute', zIndex: '2', background: 'transparent' });
+    if (sceneEl && sceneEl.renderer) sceneEl.renderer.setClearColor(0x000000, 0);
+    if (sceneEl) sceneEl.style.background = 'transparent';
+  };
+  window.addEventListener('arjs-video-loaded', fix);
+  window.addEventListener('resize', () => setTimeout(fix, 300));
+  let n = 0;
+  const id = setInterval(() => { fix(); if (++n > 40) clearInterval(id); }, 300);
+}
+
+async function start() {
+  const err = document.getElementById('err');
+  try {
+    if (!DEMO) {
+      if (!window.isSecureContext || !navigator.mediaDevices) {
+        throw new Error('カメラを使うには https:// のページで開いてください。');
+      }
+      await loadScript('https://cdn.jsdelivr.net/gh/AR-js-org/AR.js@3.4.5/aframe/build/aframe-ar.js');
+    }
+    document.body.insertAdjacentHTML('beforeend', DEMO ? demoScene() : arScene());
+    document.getElementById('start').hidden = true;
+    document.getElementById('bottom').hidden = false;
+    document.getElementById('tapWrap').hidden = false;
+    setTimeout(() => { const th = document.getElementById('tapHint'); if (th) th.style.opacity = '0'; }, 9000);
+    const hint = document.getElementById('hint');
+    if (DEMO) { hint.textContent = 'プレビュー表示'; setTimeout(() => hint.classList.add('found'), 2500); }
+    else {
+      const m = document.getElementById('marker');
+      m.addEventListener('markerFound', () => hint.classList.add('found'));
+      m.addEventListener('markerLost', () => hint.classList.remove('found'));
+      keepVideoVisible();
+    }
+  } catch (e) {
+    err.textContent = e.message || '読み込みに失敗しました。電波のよい場所でもう一度お試しください。';
+    err.hidden = false;
+  }
+}
+
+const driveComp = () => document.querySelector('[drive]')?.components.drive;
+document.getElementById('goBtn').addEventListener('click', start);
+document.getElementById('stopBtn').addEventListener('click', e => {
+  const d = driveComp(); if (!d) return;
+  d.running = !d.running; e.currentTarget.textContent = d.running ? '停止' : '走行';
+});
+document.getElementById('lightBtn').addEventListener('click', e => {
+  const d = driveComp(); if (!d) return;
+  d.setLights(!d.lightsOn); e.currentTarget.setAttribute('aria-pressed', String(d.lightsOn));
+});
+document.getElementById('roadBtn').addEventListener('click', e => {
+  const d = driveComp(); if (!d) return;
+  const i = (SURFACES.findIndex(x => x.id === d.surface) + 1) % SURFACES.length;
+  d.setSurface(SURFACES[i].id); e.currentTarget.textContent = SURFACES[i].label;
+});
+// 画面をタップ (ボタン以外) でエンジンを吹かす
+document.addEventListener('pointerdown', e => {
+  if (e.target.closest('.bar, #start, button')) return;
+  const d = driveComp(); if (!d || !d.model) return;
+  d.revEngine();
+  const th = document.getElementById('tapHint'); if (th) th.style.opacity = '0';
+});
+document.getElementById('speedBtn').addEventListener('click', e => {
+  const d = driveComp(); if (!d) return;
+  const slow = d.base > 0.7; d.base = slow ? 0.45 : 1;
+  e.currentTarget.textContent = slow ? '通常' : '低速';
+});
+</script>
+</body>
+</html>
