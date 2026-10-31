@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<title>Land Cruiser AR</title>
+<script src="https://aframe.io/releases/1.3.0/aframe.min.js"></script>
+<style>
+  :root {
+    --fg: #ffffff;
+    --fg-dim: rgba(255,255,255,.7);
+    --glass: rgba(20,20,20,.55);
+    --line: rgba(255,255,255,.18);
+    --font: -apple-system, "Hiragino Sans", "Noto Sans JP", "Yu Gothic", sans-serif;
+  }
+  [hidden] { display: none !important; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: transparent; font-family: var(--font); }
+
+  .ui { position: fixed; left: 0; right: 0; z-index: 10; display: flex; justify-content: center; pointer-events: none;
+        padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+  .ui > * { pointer-events: auto; }
+  #top { bottom: 0; padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 84px); }
+  #hint { color: var(--fg); background: var(--glass); padding: 8px 14px; border-radius: 8px;
+          font-size: 15px; letter-spacing: .02em; transition: opacity .4s;
+          -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+  #hint.found { opacity: 0; }
+  #statusWrap { top: 50%; transform: translateY(-50%); }
+  #status { color: var(--fg); background: var(--glass); padding: 10px 16px; border-radius: 8px; font-size: 15px;
+            font-variant-numeric: tabular-nums; -webkit-backdrop-filter: blur(8px); backdrop-filter: blur(8px); }
+  #bottom { top: 0; padding-top: calc(env(safe-area-inset-top, 0px) + 12px); }
+  .bar { display: flex; border-radius: 12px; overflow: hidden; background: var(--glass);
+         -webkit-backdrop-filter: blur(10px); backdrop-filter: blur(10px); border: 1px solid var(--line); }
+  .bar button { appearance: none; border: 0; background: none; color: var(--fg); font: 500 16px/1 var(--font);
+                padding: 15px 22px; min-width: 84px; cursor: pointer; }
+  .bar button + button { border-left: 1px solid var(--line); }
+  .bar button:active { background: rgba(255,255,255,.12); }
+  .bar button:focus-visible { outline: 2px solid var(--fg); outline-offset: -2px; }
+
+  #start { position: fixed; inset: 0; z-index: 20; background: #111; color: var(--fg);
+           display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 14px; text-align: center;
+           padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); }
+  #start h1 { margin: 0; font-size: 22px; font-weight: 600; letter-spacing: .06em; }
+  #start p { margin: 0; font-size: 15px; line-height: 1.7; color: var(--fg-dim); }
+  #goBtn { margin-top: 10px; appearance: none; border: 1px solid var(--fg); background: none; color: var(--fg);
+           font: 500 17px/1 var(--font); padding: 14px 40px; border-radius: 10px; cursor: pointer; }
+  #goBtn:active { background: rgba(255,255,255,.12); }
+  #err { color: #ff9b85; }
+</style>
+</head>
+<body>
+
+<div id="start">
+  <h1>Land Cruiser AR</h1>
+  <p>カメラを許可して、カード中央のマークを映してください。</p>
+  <button id="goBtn">開始</button>
+  <p id="err" hidden></p>
+</div>
+
+<div class="ui" id="top"><div id="hint">カードを映してください</div></div>
+<div class="ui" id="statusWrap"><div id="status" hidden></div></div>
+<div class="ui" id="bottom" hidden>
+  <div class="bar">
+    <button id="stopBtn">停止</button>
+    <button id="hornBtn">ホーン</button>
+    <button id="speedBtn">低速</button>
+  </div>
+</div>
+
+<script>
+/* ===== 設定 ===== */
+const CONFIG = {
+  bodyColor: new URLSearchParams(location.search).get('color') || '#e9e4d6', // 車体の色 (?color=%23c8b48a など)
+  // ランクルのモデル (前向き +X、全長 1 に変換済み)。読めなければオリジナルの四駆を出します。
+  glbFile: 'car.glb',
+  carLength: 2.05,   // 車の全長 (黒い四角の幅 64mm = 1 → 約131mm、カードいっぱい)
+  cardHalfW: 74 / 64, // カードの半分の横幅 (148mm)
+  cardHalfH: 50 / 64, // カードの半分の縦幅 (100mm)
+};
+const DEMO = new URLSearchParams(location.search).has('demo');
+const THREE = AFRAME.THREE;
+
+/* ===== オリジナルの四駆 (ショートボディのクロカン) ===== */
+function buildCar(color) {
+  const g = new THREE.Group();
+  const mat = c => new THREE.MeshStandardMaterial({ color: c, roughness: 0.6, metalness: 0.05 });
+  const body = mat(color), black = mat('#1d1d1d'), glass = mat('#27323a'), chrome = mat('#b9b9b9');
+  const lamp = new THREE.MeshStandardMaterial({ color: '#fff6d0', emissive: '#ffe9a0', emissiveIntensity: 0.6 });
+  const tail = new THREE.MeshStandardMaterial({ color: '#c0281f', emissive: '#7a0d08', emissiveIntensity: 0.5 });
+  const box = (w, h, d, m, x, y, z) => { const o = new THREE.Mesh(new THREE.BoxGeometry(w, h, d), m); o.position.set(x, y, z); g.add(o); return o; };
+  const cyl = (r, l, m, x, y, z, axis) => {
+    const o = new THREE.Mesh(new THREE.CylinderGeometry(r, r, l, 24), m);
+    if (axis === 'z') o.rotation.x = Math.PI / 2; else if (axis === 'x') o.rotation.z = Math.PI / 2;
+    o.position.set(x, y, z); g.add(o); return o;
+  };
+  // 車体 (前向き = +x)
+  box(3.9, 0.62, 1.70, body, 0, 0.92, 0);           // 下半分
+  box(1.45, 0.10, 1.66, body, 1.22, 1.27, 0);        // ボンネット
+  box(2.45, 0.76, 1.62, body, -0.68, 1.60, 0);       // キャビン (角ばった箱)
+  box(2.50, 0.06, 1.66, body, -0.68, 2.00, 0);       // ルーフ
+  // 窓
+  box(0.04, 0.52, 1.44, glass, 0.535, 1.62, 0);      // フロントガラス
+  box(0.04, 0.48, 1.40, glass, -1.915, 1.64, 0);     // リア窓
+  for (const s of [1, -1]) {
+    box(0.72, 0.46, 0.04, glass, 0.08, 1.64, s * 0.815);
+    box(1.40, 0.46, 0.04, glass, -1.12, 1.64, s * 0.815);
+  }
+  // フェンダー (黒いオーバーフェンダー)
+  for (const x of [1.15, -1.15]) for (const s of [1, -1]) box(1.12, 0.14, 0.12, black, x, 1.02, s * 0.88);
+  // バンパー
+  box(0.20, 0.20, 1.86, black, 2.02, 0.62, 0);
+  box(0.20, 0.20, 1.80, black, -2.02, 0.62, 0);
+  // グリル + 丸目ライト
+  box(0.05, 0.40, 1.20, black, 1.97, 0.98, 0);
+  for (const s of [1, -1]) {
+    cyl(0.15, 0.06, chrome, 1.985, 1.0, s * 0.62, 'x');
+    cyl(0.12, 0.08, lamp, 1.995, 1.0, s * 0.62, 'x');
+    box(0.06, 0.16, 0.10, tail, -1.97, 1.05, s * 0.74);   // テールランプ
+    box(0.18, 0.12, 0.06, black, 0.45, 1.52, s * 0.90);   // ミラー
+  }
+  // シュノーケル (右前)
+  box(0.12, 0.70, 0.12, black, 0.62, 1.60, 0.90);
+  box(0.26, 0.12, 0.14, black, 0.69, 2.00, 0.90);
+  // ルーフキャリア
+  for (const z of [0.6, -0.6]) box(2.2, 0.05, 0.05, black, -0.70, 2.12, z);
+  for (const x of [0.3, -0.7, -1.7]) box(0.05, 0.05, 1.25, black, x, 2.12, 0);
+  // 背面スペアタイヤ
+  cyl(0.38, 0.26, black, -2.12, 1.25, 0.32, 'x');
+  cyl(0.18, 0.28, chrome, -2.12, 1.25, 0.32, 'x');
+  // タイヤ
+  const wheels = [];
+  for (const x of [1.15, -1.15]) for (const s of [1, -1]) {
+    const w = new THREE.Group(); w.position.set(x, 0.42, s * 0.80);
+    const tire = new THREE.Mesh(new THREE.CylinderGeometry(0.42, 0.42, 0.32, 24), black); tire.rotation.x = Math.PI / 2;
+    const hub = new THREE.Mesh(new THREE.CylinderGeometry(0.22, 0.22, 0.34, 12), chrome); hub.rotation.x = Math.PI / 2;
+    const tread = new THREE.Mesh(new THREE.BoxGeometry(0.86, 0.08, 0.36), mat('#333')); // 回転が見える目印
+    w.add(tire, hub, tread); g.add(w); wheels.push(w);
+  }
+  // 影
+  const sh = new THREE.Mesh(new THREE.CircleGeometry(1, 32),
+    new THREE.MeshBasicMaterial({ color: '#000', transparent: true, opacity: 0.28, depthWrite: false }));
+  sh.rotation.x = -Math.PI / 2; sh.scale.set(2.3, 1.1, 1); sh.position.y = 0.01; g.add(sh);
+  g.userData.wheels = wheels;
+  return g;
+}
+
+/* ===== 読み込み表示 ===== */
+function setStatus(t) {
+  const el = document.getElementById('status');
+  if (!el) return;
+  el.textContent = t; el.hidden = !t;
+}
+
+/* ===== メッキが映り込むための簡単な環境光 ===== */
+let envDone = false;
+function applyEnvironment(sceneEl) {
+  if (envDone || !sceneEl.renderer) return; envDone = true;
+  try {
+    const r = sceneEl.renderer;
+    const env = new THREE.Scene();
+    const geo = new THREE.SphereGeometry(10, 32, 16);
+    const col = []; const pos = geo.attributes.position;
+    for (let i = 0; i < pos.count; i++) {
+      const y = pos.getY(i) / 10;
+      const c = y > 0 ? new THREE.Color('#f4f6f8').lerp(new THREE.Color('#bcc6d0'), 1 - y) : new THREE.Color('#6b665e').lerp(new THREE.Color('#2e2b27'), -y);
+      col.push(c.r, c.g, c.b);
+    }
+    geo.setAttribute('color', new THREE.Float32BufferAttribute(col, 3));
+    env.add(new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.BackSide })));
+    for (const [x, y, z, w] of [[4, 6, 3, 4], [-5, 5, -2, 3]]) {
+      const p = new THREE.Mesh(new THREE.PlaneGeometry(w, w * 0.6), new THREE.MeshBasicMaterial({ color: '#ffffff', side: THREE.DoubleSide }));
+      p.position.set(x, y, z); p.lookAt(0, 0, 0); env.add(p);
+    }
+    const pm = new THREE.PMREMGenerator(r);
+    sceneEl.object3D.environment = pm.fromScene(env, 0.04).texture;
+    pm.dispose();
+  } catch (e) { /* 環境光なしでも表示はできる */ }
+}
+
+/* ===== 走る動き: カードいっぱいの大きさで、その場で走っている ===== */
+AFRAME.registerComponent('drive', {
+  init() {
+    this.running = true; this.base = 1; this.v = 0; this.dist = 0; this.time = 0;
+    const CL = CONFIG.carLength;
+    this.holder = new THREE.Group();
+    this.bob = new THREE.Group();
+    this.holder.add(this.bob);
+    this.el.object3D.add(this.holder);
+    this.wheels = []; this.wheelR = 1;
+    this.loadModel();
+    // 後ろへ流れる路面のライン (走っているように見せる)
+    this.lines = [];
+    const lm = new THREE.MeshBasicMaterial({ color: '#4a4740', transparent: true, opacity: 0.55, depthWrite: false });
+    for (const z of [-CONFIG.cardHalfH * 0.78, CONFIG.cardHalfH * 0.78]) {
+      for (let i = 0; i < 7; i++) {
+        const m = new THREE.Mesh(new THREE.PlaneGeometry(CL * 0.12, CL * 0.012), lm);
+        m.rotation.x = -Math.PI / 2; m.position.set(0, 0.002, z); m.userData.off = i / 7;
+        this.el.object3D.add(m); this.lines.push(m);
+      }
+    }
+    // 砂ぼこり
+    this.dust = [];
+    const dm = new THREE.MeshBasicMaterial({ color: '#c9b08a', transparent: true, opacity: 0.5, depthWrite: false });
+    for (let i = 0; i < 30; i++) {
+      const p = new THREE.Mesh(new THREE.SphereGeometry(CL * 0.035, 10, 8), dm.clone());
+      p.visible = false; p.userData = { life: 0, v: new THREE.Vector3() };
+      this.el.object3D.add(p); this.dust.push(p);
+    }
+    this.dustTimer = 0;
+    // 岩 (カードの上を後ろへ流れ、タイヤが乗り上げる)
+    this.rocks = [];
+    const rm = new THREE.MeshStandardMaterial({ color: '#8a8276', roughness: 0.95, flatShading: true });
+    for (let i = 0; i < 8; i++) {
+      const g = new THREE.DodecahedronGeometry(1, 0);
+      const p = g.attributes.position;
+      for (let j = 0; j < p.count; j++) p.setXYZ(j, p.getX(j) * (0.8 + Math.random() * 0.4), p.getY(j) * (0.8 + Math.random() * 0.4), p.getZ(j) * (0.8 + Math.random() * 0.4));
+      g.computeVertexNormals();
+      const m = new THREE.Mesh(g, rm);
+      m.visible = false; m.userData = { h: 0, r: 0 };
+      this.el.object3D.add(m); this.rocks.push(m);
+    }
+    this.rockTimer = 0.4; this.lastTrack = 1;
+    this.pose = { y: 0, rz: 0, rx: 0 };
+  },
+  setupWheels(scale) {
+    this.wheelScale = scale;
+    this.wheelBase = this.wheels.map(w => w.position.clone());
+  },
+  spawnRock() {
+    const r = this.rocks.find(o => !o.visible);
+    if (!r || !this.wheelBase || this.wheelBase.length < 4) return;
+    const CL = CONFIG.carLength, sc = this.wheelScale;
+    // 左右どちらかの轍 (ときどき両方)
+    const tracks = [this.wheelBase[0].z * sc, this.wheelBase[1].z * sc];
+    this.lastTrack = Math.random() < 0.7 ? 1 - this.lastTrack : this.lastTrack;
+    const big = Math.random() < 0.35;
+    const h = CL * (big ? 0.045 + Math.random() * 0.02 : 0.022 + Math.random() * 0.015);  // 高さ
+    const rad = h * (1.5 + Math.random() * 0.6);                                           // 前後の長さの半分
+    r.userData.h = h; r.userData.r = rad; r.userData.grow = 0;
+    r.position.set(CONFIG.cardHalfW * 0.98, 0, tracks[this.lastTrack] + (Math.random() - 0.5) * CL * 0.02);
+    r.scale.set(rad, h, rad * (0.8 + Math.random() * 0.4));
+    r.rotation.y = Math.random() * Math.PI;
+    r.visible = true;
+  },
+  terrainAt(x, z) {
+    let h = 0;
+    const halfW = this.wheelR * 0.75;   // タイヤの幅の半分くらい
+    for (const r of this.rocks) {
+      if (!r.visible || Math.abs(r.position.z - z) > halfW + r.scale.z * 0.6) continue;
+      const span = r.userData.r + this.wheelR * 0.55;   // タイヤが丸いぶん少し手前から乗り始める
+      const dx = x - r.position.x;
+      if (Math.abs(dx) < span) {
+        const c = Math.cos(Math.PI / 2 * dx / span);
+        h = Math.max(h, r.userData.h * c * c * (2 - c * c) * r.userData.grow);
+      }
+    }
+    return h;
+  },
+  useFallback() {
+    if (this.model) return;
+    const SCALE = CONFIG.carLength / 4.4;
+    const car = buildCar(CONFIG.bodyColor);
+    car.scale.setScalar(SCALE);
+    this.bob.add(car); this.model = car;
+    this.wheels = car.userData.wheels; this.wheelR = 0.42 * SCALE;
+    this.setupWheels(SCALE);
+    setStatus('');
+  },
+  loadModel() {
+    const CL = CONFIG.carLength;
+    const onModel = (root) => {
+      root.scale.setScalar(CL);
+      this.bob.add(root); this.model = root;
+      this.wheels = ['wheel_FL', 'wheel_FR', 'wheel_RL', 'wheel_RR'].map(n => root.getObjectByName(n)).filter(Boolean);
+      const r = this.wheels[0] && this.wheels[0].userData && this.wheels[0].userData.radius;
+      this.wheelR = (r || 0.1) * CL;
+      this.setupWheels(CL);
+      root.traverse(o => { if (o.isMesh) { o.frustumCulled = false; o.material.envMapIntensity = 0.6; if (o.material.transparent) o.renderOrder = 2; } });
+      // 接地影
+      const sh = new THREE.Mesh(new THREE.CircleGeometry(0.5, 40),
+        new THREE.MeshBasicMaterial({ color: '#000', transparent: true, opacity: 0.32, depthWrite: false }));
+      sh.rotation.x = -Math.PI / 2; sh.scale.set(CL * 1.08, CL * 0.62, 1); sh.position.y = 0.003;
+      this.holder.add(sh);
+      applyEnvironment(this.el.sceneEl);
+      setStatus('');
+    };
+    const L = THREE.GLTFLoader;
+    if (L) {
+      new L().load(CONFIG.glbFile, g => onModel(g.scene),
+        e => { if (e.total) setStatus('読み込み中 ' + Math.round(e.loaded / e.total * 100) + '%'); else setStatus('読み込み中…'); },
+        () => this.useFallback());
+    } else {
+      const ent = document.createElement('a-entity');
+      ent.setAttribute('gltf-model', CONFIG.glbFile);
+      ent.addEventListener('model-loaded', () => { const o = ent.getObject3D('mesh'); this.el.object3D.remove(ent.object3D); onModel(o); });
+      ent.addEventListener('model-error', () => this.useFallback());
+      this.el.appendChild(ent);
+      setStatus('読み込み中…');
+    }
+  },
+  tick(time, dtMs) {
+    const dt = Math.min(dtMs || 16, 50) / 1000;
+    const CL = CONFIG.carLength, hw = CONFIG.cardHalfW;
+    this.time += dt;
+    const vTarget = this.running ? this.base : 0;
+    this.v += (vTarget - this.v) * Math.min(1, dt * 2);
+    const ground = this.v * CL * 0.6;          // 路面が流れる速さ
+    this.dist += ground * dt;
+    const k = Math.min(1, this.v / Math.max(this.base, 0.01));
+    const t = this.time;
+    // ハンドルを少しずつ切る
+    const steer = Math.sin(t * 0.7) * 0.10 * k;
+    this.holder.rotation.y = Math.sin(t * 0.7 + 0.8) * 0.02 * k;
+    // 岩を流す・出す
+    this.rockTimer -= dt * k;
+    if (this.rockTimer <= 0) { this.spawnRock(); this.rockTimer = 0.55 + Math.random() * 0.9; }
+    for (const r of this.rocks) {
+      if (!r.visible) continue;
+      r.position.x -= ground * dt;
+      const u = (hw - r.position.x) / (2 * hw);           // 0: 出てきた所, 1: 消える所
+      r.userData.grow = Math.max(0, Math.min(1, Math.min(u, 1 - u) / 0.08));
+      r.scale.y = r.userData.h * r.userData.grow;
+      if (r.position.x < -hw * 0.98) r.visible = false;
+    }
+    // 4つのタイヤの下の高さから、車体の傾きを決める
+    if (this.wheelBase && this.wheelBase.length === 4) {
+      const sc = this.wheelScale, zOff = this.holder.position.z;
+      const W = this.wheelBase.map(b => ({ x: b.x * sc, z: b.z * sc + zOff }));
+      const h = W.map(w => this.terrainAt(w.x, w.z));
+      const xf = W[0].x, xr = W[2].x, zl = W[0].z, zr = W[1].z;
+      const hF = (h[0] + h[1]) / 2, hR = (h[2] + h[3]) / 2, hL = (h[0] + h[2]) / 2, hRt = (h[1] + h[3]) / 2;
+      const tz = Math.atan2(hF - hR, xf - xr) * 1.4;   // 前後の傾きは少し大げさに
+      const tx = Math.atan2(hL - hRt, zr - zl);
+      const ty = (h[0] + h[1] + h[2] + h[3]) / 4 * 0.85;
+      const a = Math.min(1, dt * 14);                       // サスペンションのやわらかさ
+      this.pose.rz += (tz - this.pose.rz) * a;
+      this.pose.rx += (tx - this.pose.rx) * a;
+      this.pose.y += (ty - this.pose.y) * a;
+      const vib = CL * 0.0012 * k;                          // エンジンの細かい振動
+      this.bob.position.y = this.pose.y + Math.sin(t * 38) * vib;
+      this.bob.rotation.z = this.pose.rz;
+      this.bob.rotation.x = this.pose.rx + Math.sin(t * 31) * 0.002 * k;
+      // タイヤは岩に沿って上下 (足が伸び縮みする)
+      const tanZ = Math.tan(this.pose.rz), tanX = Math.tan(this.pose.rx);
+      this.wheels.forEach((w, i) => {
+        const plane = this.pose.y + W[i].x * tanZ - (W[i].z - zOff) * tanX;
+        const off = Math.max(-this.wheelR * 0.7, Math.min(this.wheelR * 0.7, h[i] - plane));
+        w.position.y = this.wheelBase[i].y + off / sc;
+      });
+    }
+    this.wheels.forEach((w, i) => {
+      w.rotation.z = -this.dist / this.wheelR;
+      w.rotation.y = i < 2 ? steer : 0;
+    });
+    for (const m of this.lines) {
+      const u = ((m.userData.off - this.dist / (hw * 2)) % 1 + 1) % 1;
+      m.position.x = hw * 0.95 - u * hw * 1.9;
+      m.material.opacity = 0.5 * Math.min(1, Math.min(u, 1 - u) * 6) * (0.3 + 0.7 * k);
+    }
+    // 後輪から砂ぼこり
+    if (k > 0.3) {
+      this.dustTimer += dt;
+      if (this.dustTimer > 0.05) {
+        this.dustTimer = 0;
+        const p = this.dust.find(d => !d.visible);
+        if (p) {
+          const side = Math.random() < 0.5 ? -1 : 1;
+          const loc = new THREE.Vector3(-CL * 0.3, CL * 0.02, side * CL * 0.19).applyEuler(this.holder.rotation);
+          p.position.set(loc.x, loc.y, loc.z + this.holder.position.z);
+          p.userData.life = 1;
+          p.userData.v.set(-CL * (0.5 + Math.random() * 0.4), CL * (0.08 + Math.random() * 0.1), side * CL * Math.random() * 0.1);
+          p.visible = true;
+        }
+      }
+    }
+    for (const p of this.dust) {
+      if (!p.visible) continue;
+      p.userData.life -= dt * 1.4;
+      if (p.userData.life <= 0) { p.visible = false; continue; }
+      p.position.addScaledVector(p.userData.v, dt);
+      p.scale.setScalar(0.6 + (1 - p.userData.life) * 2.2);
+      p.material.opacity = 0.4 * p.userData.life;
+    }
+  }
+});
+
+/* ===== クラクション ===== */
+let audio;
+function horn() {
+  try {
+    audio = audio || new (window.AudioContext || window.webkitAudioContext)();
+    const now = audio.currentTime, out = audio.createGain(), lp = audio.createBiquadFilter();
+    lp.type = 'lowpass'; lp.frequency.value = 1800;
+    out.gain.setValueAtTime(0, now);
+    for (const [t0, len] of [[0, 0.16], [0.24, 0.32]]) {
+      out.gain.setValueAtTime(0.0001, now + t0);
+      out.gain.linearRampToValueAtTime(0.25, now + t0 + 0.02);
+      out.gain.setValueAtTime(0.25, now + t0 + len - 0.03);
+      out.gain.linearRampToValueAtTime(0.0001, now + t0 + len);
+    }
+    for (const f of [415, 523]) {
+      const o = audio.createOscillator(); o.type = 'square'; o.frequency.value = f;
+      o.connect(lp); o.start(now); o.stop(now + 0.6);
+    }
+    lp.connect(out); out.connect(audio.destination);
+  } catch (e) {}
+  if (navigator.vibrate) navigator.vibrate(60);
+}
+
+/* ===== シーンを作る ===== */
+const CAR_LIGHTS = `
+  <a-entity light="type: ambient; intensity: 0.4"></a-entity>
+  <a-entity light="type: directional; intensity: 0.65" position="0.6 2 1"></a-entity>`;
+
+function arScene() {
+  return `
+  <a-scene embedded vr-mode-ui="enabled: false" renderer="logarithmicDepthBuffer: true; antialias: true; alpha: true; colorManagement: true" background="transparent: true"
+           arjs="sourceType: webcam; debugUIEnabled: false; detectionMode: mono; patternRatio: 0.5;">
+    ${CAR_LIGHTS}
+    <a-marker id="marker" type="pattern" url="marker.patt" emitevents="true"
+              smooth="true" smoothCount="8" smoothTolerance="0.01" smoothThreshold="4">
+      <a-entity drive></a-entity>
+    </a-marker>
+    <a-entity camera></a-entity>
+  </a-scene>`;
+}
+
+function demoScene() {
+  return `
+  <a-scene vr-mode-ui="enabled: false" background="color: #2a2620" renderer="antialias: true; colorManagement: true">
+    ${CAR_LIGHTS}
+    <a-plane src="card-preview.jpg" width="2.3125" height="1.5625" rotation="-90 0 0"></a-plane>
+    <a-entity drive></a-entity>
+    <a-entity position="0 0.3 0" rotation="-32 -35 0">
+      <a-entity camera="fov: 50" look-controls="enabled: false" wasd-controls="enabled: false" position="0 0 4.2"></a-entity>
+    </a-entity>
+  </a-scene>`;
+}
+
+function loadScript(src) {
+  return new Promise((ok, ng) => { const s = document.createElement('script'); s.src = src; s.onload = ok; s.onerror = ng; document.head.appendChild(s); });
+}
+
+/* カメラ映像を必ず3Dの下に見えるようにする
+   (AR.js は映像を z-index:-2 に置くため、端末によっては隠れて真っ黒になる) */
+function keepVideoVisible() {
+  const fix = () => {
+    const v = document.getElementById('arjs-video') || document.querySelector('video');
+    if (v) {
+      v.muted = true; v.setAttribute('muted', ''); v.setAttribute('playsinline', ''); v.setAttribute('autoplay', '');
+      Object.assign(v.style, { zIndex: '0', display: 'block', visibility: 'visible', opacity: '1' });
+      if (v.paused) v.play().catch(() => {});
+    }
+    const sceneEl = document.querySelector('a-scene');
+    const canvas = sceneEl && sceneEl.canvas;
+    if (canvas) Object.assign(canvas.style, { position: 'absolute', zIndex: '1', background: 'transparent' });
+    if (sceneEl && sceneEl.renderer) sceneEl.renderer.setClearColor(0x000000, 0);
+    if (sceneEl) sceneEl.style.background = 'transparent';
+  };
+  window.addEventListener('arjs-video-loaded', fix);
+  window.addEventListener('resize', () => setTimeout(fix, 300));
+  let n = 0;
+  const id = setInterval(() => { fix(); if (++n > 40) clearInterval(id); }, 300);
+}
+
+async function start() {
+  const err = document.getElementById('err');
+  try {
+    if (!DEMO) {
+      if (!window.isSecureContext || !navigator.mediaDevices) {
+        throw new Error('カメラを使うには https:// のページで開いてください。');
+      }
+      await loadScript('https://cdn.jsdelivr.net/gh/AR-js-org/AR.js@3.4.5/aframe/build/aframe-ar.js');
+    }
+    document.body.insertAdjacentHTML('beforeend', DEMO ? demoScene() : arScene());
+    document.getElementById('start').hidden = true;
+    document.getElementById('bottom').hidden = false;
+    const hint = document.getElementById('hint');
+    if (DEMO) { hint.textContent = 'プレビュー表示'; setTimeout(() => hint.classList.add('found'), 2500); }
+    else {
+      const m = document.getElementById('marker');
+      m.addEventListener('markerFound', () => hint.classList.add('found'));
+      m.addEventListener('markerLost', () => hint.classList.remove('found'));
+      keepVideoVisible();
+    }
+    try { audio = new (window.AudioContext || window.webkitAudioContext)(); audio.resume(); } catch (e) {}
+  } catch (e) {
+    err.textContent = e.message || '読み込みに失敗しました。電波のよい場所でもう一度お試しください。';
+    err.hidden = false;
+  }
+}
+
+const driveComp = () => document.querySelector('[drive]')?.components.drive;
+document.getElementById('goBtn').addEventListener('click', start);
+document.getElementById('hornBtn').addEventListener('click', horn);
+document.getElementById('stopBtn').addEventListener('click', e => {
+  const d = driveComp(); if (!d) return;
+  d.running = !d.running; e.currentTarget.textContent = d.running ? '停止' : '走行';
+});
+document.getElementById('speedBtn').addEventListener('click', e => {
+  const d = driveComp(); if (!d) return;
+  const slow = d.base > 0.7; d.base = slow ? 0.45 : 1;
+  e.currentTarget.textContent = slow ? '通常' : '低速';
+});
+</script>
+</body>
+</html>
